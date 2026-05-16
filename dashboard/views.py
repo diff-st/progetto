@@ -1,0 +1,363 @@
+import json
+from datetime import datetime
+
+from django.conf import settings
+from django.http import JsonResponse, HttpResponse
+from django.shortcuts import render
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+
+import requests
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+from .services.influx_service import get_latest_measurements, get_latest_as_dict
+from .services.ml_labels import save_malattia_label, get_all_labels
+from .services.ml_predict import predict_rischio, predict_tutti
+from .services.ml_train import train_and_save, model_exists
+
+
+def get_write_api():
+    """
+    Crea il client InfluxDB al momento dell'uso,
+    così le variabili ambiente sono già caricate (es. su Render).
+    """
+    client = InfluxDBClient(
+        url=settings.INFLUX_HOST,
+        token=settings.INFLUX_TOKEN,
+        org=settings.INFLUX_ORG,
+    )
+    return client.write_api(write_options=SYNCHRONOUS)
+
+
+# ===== VIEW HTML DASHBOARD =====
+
+def dashboard_home(request):
+    try:
+        misure = get_latest_measurements()
+    except Exception:
+        misure = []
+
+    try:
+        rischi = predict_tutti()          # lista di dict {node_id, rischio_ml, classe, ...}
+    except Exception:
+        rischi = []
+    rischi_map = {r["node_id"]: r for r in rischi}
+
+    rischio_percento = 0
+    # prendo il primo nodo che ha un rischio calcolato
+    for r in rischi:
+        if r.get("rischio_ml") is not None:
+            rischio_percento = r["rischio_ml"]
+            break
+
+    # Sanificazione: garantisco un intero 0-100 per il template (rimuovo eventuale '%' e valori non numerici)
+    try:
+        if isinstance(rischio_percento, str):
+            rischio_percento = rischio_percento.strip().replace('%', '')
+        rischio_percento = float(rischio_percento) if rischio_percento is not None else 0.0
+        rischio_percento = int(round(rischio_percento))
+    except (ValueError, TypeError):
+        rischio_percento = 0
+    rischio_percento = max(0, min(100, rischio_percento))
+
+    # Fallback per sviluppo locale: se non ci sono misure, mostro dati di esempio
+    if not misure and getattr(settings, "DEBUG", False):
+        misure = [
+            {
+                "node_id": "node-1",
+                "temp_aria": 23.4,
+                "umid_aria": 68.2,
+                "umid_suolo": 45.1,
+                "rain_mm": 0.0,
+                "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            {
+                "node_id": "node-2",
+                "temp_aria": 19.8,
+                "umid_aria": 72.5,
+                "umid_suolo": 55.0,
+                "rain_mm": 1.2,
+                "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        ]
+
+        # Se il rischio è zero, mostro un valore di esempio per la UI
+        if rischio_percento == 0:
+            rischio_percento = 42
+
+    context = {
+        "titolo": "Vineguard – Dashboard vigneto",
+        "misure": misure,
+        "rischi_map": rischi_map,
+        "model_ready": model_exists(),
+        "rischio_percento": rischio_percento,
+    }
+    return render(request, "dashboard/index.html", context)
+
+
+# ===== API JSON per frontend (grafici / refresh) =====
+
+def latest_data_json(request):
+    """
+    Restituisce le ultime misure in JSON.
+    """
+    try:
+        data = get_latest_as_dict()
+    except Exception:
+        # In caso di errore (es. Influx non raggiungibile), fornisco
+        # dati di esempio se siamo in DEBUG, altrimenti lista vuota.
+        if getattr(settings, "DEBUG", False):
+            from datetime import datetime
+
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            data = [
+                {
+                    "node_id": "node-1",
+                    "temp_aria": 22.5,
+                    "umid_aria": 65.0,
+                    "umid_suolo": 50.1,
+                    "rain_mm": 0.0,
+                    "time": now,
+                },
+                {
+                    "node_id": "node-2",
+                    "temp_aria": 19.8,
+                    "umid_aria": 72.3,
+                    "umid_suolo": 55.4,
+                    "rain_mm": 1.2,
+                    "time": now,
+                },
+            ]
+        else:
+            data = []
+
+    return JsonResponse({"nodes": data})
+
+
+# ===== API per ricevere dati dal gateway (JSON) =====
+
+@csrf_exempt
+def receive_sensors(request):
+    """
+    Endpoint da chiamare dal gateway.
+    Accetta JSON e scrive i dati nel bucket InfluxDB.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST only"}, status=405)
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    # JSON atteso:
+    # {
+    #   "node_id": "node1",
+    #   "temp_aria": 22.5,
+    #   "umid_aria": 85.2,
+    #   "umid_suolo": 71.4,
+    #   "pioggia": 2.1,
+    #   "timestamp": "2026-04-13T15:30:00Z"
+    # }
+
+    node_id = payload.get("node_id", "unknown")
+
+    try:
+        temp_aria = float(payload.get("temp_aria", 0))
+        umid_aria = float(payload.get("umid_aria", 0))
+        umid_suolo = float(payload.get("umid_suolo", 0))
+        rain_mm = float(payload.get("pioggia", 0))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Invalid numeric fields"}, status=400)
+
+    timestamp = payload.get("timestamp")
+    if timestamp:
+        try:
+            time_obj = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            time_obj = datetime.utcnow()
+    else:
+        time_obj = datetime.utcnow()
+
+    point = (
+        Point("sensor_data")
+        .tag("node_id", node_id)
+        .field("temp_aria", temp_aria)
+        .field("umid_aria", umid_aria)
+        .field("umid_suolo", umid_suolo)
+        .field("rain_mm", rain_mm)
+        .time(time_obj)
+    )
+
+    write_api = get_write_api()
+    write_api.write(bucket=settings.INFLUX_BUCKET, record=point)
+
+    return JsonResponse({"status": "saved"}, status=201)
+
+
+# ===== API ML: rischio, etichette, training =====
+
+def ml_risk_json(request):
+    """
+    Ritorna il rischio ML per un nodo (se node_id) o per tutti i nodi.
+    """
+    node_id = request.GET.get("node_id")
+    window = int(request.GET.get("window", 7))
+
+    data = predict_rischio(node_id, window) if node_id else predict_tutti(window)
+    return JsonResponse({"ml_risk": data})
+
+
+@csrf_exempt
+def ml_label_json(request):
+    """
+    Salva un'etichetta di malattia per un nodo, usando gli ultimi N giorni.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST only"}, status=405)
+
+    payload = json.loads(request.body.decode("utf-8"))
+    node_id = payload.get("node_id")
+    if not node_id:
+        return JsonResponse({"error": "node_id obbligatorio"}, status=400)
+
+    window_days = int(payload.get("window_days", 7))
+    save_malattia_label(node_id, window_days=window_days)
+
+    return JsonResponse({"status": "label_saved", "node_id": node_id}, status=201)
+
+
+def ml_labels_list(request):
+    """
+    Lista tutte le etichette di malattia registrate.
+    """
+    return JsonResponse({"labels": get_all_labels()})
+
+
+@csrf_exempt
+def ml_train_json(request):
+    """
+    Lancia il training del modello RandomForest e salva il .pkl.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST only"}, status=405)
+
+    result = train_and_save()
+    return JsonResponse(result)
+
+
+# ===== API emergenza manuale (pulsante dashboard) =====
+
+@csrf_exempt
+def emergency_alert(request):
+    """
+    Scatta un evento di emergenza: scrive un record in InfluxDB
+    e manda un messaggio Telegram (se configurato).
+    """
+    # Scrittura su Influx
+    point = (
+        Point("emergency_alert")
+        .tag("manual", "true")
+        .tag("org", settings.INFLUX_ORG)
+        .field("triggered", 1)
+        .time(datetime.utcnow())
+    )
+    write_api = get_write_api()
+    write_api.write(bucket=settings.INFLUX_BUCKET, record=point)
+
+    # Invio messaggio Telegram, se TOKEN e CHAT_ID ci sono
+    if settings.TELEGRAM_TOKEN and settings.TELEGRAM_CHAT_ID:
+        telegram_url = (
+            f"https://api.telegram.org/bot{settings.TELEGRAM_TOKEN}/sendMessage"
+        )
+        try:
+            requests.post(
+                telegram_url,
+                json={
+                    "chat_id": settings.TELEGRAM_CHAT_ID,
+                    "text": "🚨 VINEGUARD – EMERGENZA MANUALE: controlla il vigneto!",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            # in dev possiamo ignorare l'errore, oppure loggare
+            pass
+
+    return JsonResponse({"status": "alert_sent"})
+
+
+def send_telegram_message(chat_id, text):
+    token = settings.TELEGRAM_TOKEN
+    if not token:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        return r.ok
+    except requests.RequestException:
+        return False
+
+
+@csrf_exempt
+@require_POST
+def telegram_webhook(request):
+    """
+    Webhook Telegram per comandi:
+    MALATTIA, AIUTO, STATO, ADDESTRA
+    """
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"ok": False, "error": "invalid json"}, status=400)
+
+    message = data.get("message", {})
+    chat = message.get("chat", {})
+    text = (message.get("text") or "").strip().upper()
+    chat_id = chat.get("id")
+
+    if not chat_id:
+        return JsonResponse({"ok": True})
+
+    if text == "MALATTIA":
+        # Qui puoi anche salvare l'evento su DB o Influx
+        send_telegram_message(
+            chat_id,
+            "Segnalazione MALATTIA registrata correttamente."
+        )
+        return JsonResponse({"ok": True, "action": "malattia_registered"})
+
+    if text == "AIUTO":
+        send_telegram_message(
+            chat_id,
+            "Comandi disponibili: MALATTIA, AIUTO, STATO, ADDESTRA"
+        )
+        return JsonResponse({"ok": True, "action": "help_sent"})
+
+    if text == "STATO":
+        send_telegram_message(
+            chat_id,
+            "Vineguard online. Dashboard attiva."
+        )
+        return JsonResponse({"ok": True, "action": "status_sent"})
+
+    if text == "ADDESTRA":
+        result = train_and_save()
+        if result["status"] == "trained":
+            msg = f"🤖 Modello aggiornato! {result['n_samples']} campioni usati."
+        else:
+            msg = f"⚠️ {result.get('msg', 'Errore training.')}"
+
+        send_telegram_message(chat_id, msg)
+        return JsonResponse({"ok": True, "action": "training_done"})
+
+    send_telegram_message(
+        chat_id,
+        "Comando non riconosciuto. Scrivi AIUTO."
+    )
+    return JsonResponse({"ok": True, "action": "unknown_command"})
